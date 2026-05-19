@@ -10,7 +10,7 @@ git clone https://github.com/AleXDE54/qwenproxy.git
 
 Install the requirements
 ```bash
-pip install -r req.txt
+pip install --break-system-packages -r req.txt
 ```
 
 Run the python file
