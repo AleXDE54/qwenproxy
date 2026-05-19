@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-QwenProxy Fast - Lightweight, high-performance proxy for Qwen AI models.
-Provides an OpenAI-compatible API with proper reasoning/thinking separation.
-"""
-
 from __future__ import annotations
 
 import asyncio
