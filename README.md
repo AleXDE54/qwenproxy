@@ -1,5 +1,12 @@
 # Free **QwenAI** self-hosted API
 
+## Features
+
+- No QwenAI accound needed!
+- Works with all latest avaiable Qwen models
+- History, Thinking intelegence working!
+- Compatile with OpenAI API
+
 ## Instalation
 (scroll for docker method)
 ### Manual method
