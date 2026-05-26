@@ -2,10 +2,11 @@
 
 ## Features
 
-- No QwenAI accound needed!
+- No QwenAI account needed!
 - Works with all latest avaiable Qwen models
 - History, Thinking intelegence working!
 - Compatile with OpenAI API
+- G4F-free!!
 
 ## Instalation
 (scroll for docker method)
