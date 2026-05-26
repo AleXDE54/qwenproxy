@@ -9,7 +9,14 @@
 - G4F-free!!
 
 ## Instalation
-(scroll for docker method)
+
+### Docker Method
+
+```bash
+docker build -t qwenproxy .
+docker run -d -p 1234:1234 --name qwenproxy qwenproxy
+```
+
 ### Manual method
 Clone the repo
 ```bash
@@ -24,11 +31,4 @@ pip install --break-system-packages -r req.txt
 Run the python file
 ```bash
 nohup python qwenproxy.py &
-```
-
-## Docker Method
-
-```bash
-docker build -t qwenproxy .
-docker run -d -p 1234:1234 --name qwenproxy qwenproxy
 ```
