@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import re
 import uuid
@@ -11,15 +9,14 @@ import os
 import sys
 from time import time
 from typing import Literal, Optional, Dict, Any, AsyncGenerator, List, Union
-from urllib.parse import quote
 from contextlib import asynccontextmanager
 
 import aiohttp
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,7 +40,7 @@ class Config:
     MIDTOKEN_REFRESH_INTERVAL = 3600
     SINGLE_PROMPT_MODE = os.getenv("QWENPROXY_SINGLE_PROMPT_MODE", "true").lower() == "true"
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
-    HEARTBEAT_INTERVAL = float(os.getenv("QWENPROXY_HEARTBEAT_INTERVAL", "5.0"))  # seconds
+    HEARTBEAT_INTERVAL = float(os.getenv("QWENPROXY_HEARTBEAT_INTERVAL", "5.0"))
 
 config = Config()
 
@@ -195,7 +192,6 @@ class QwenClient:
         use_single_prompt: bool = False,
         server_system_prompt: str = ""
     ) -> AsyncGenerator[dict, None]:
-        """Streams raw Qwen API chunks (always streaming internally)."""
         enable_thinking = reasoning_effort in ("medium", "high")
         thinking_mode: Literal["Auto", "Thinking", "Fast"] = "Auto" if enable_thinking else "Fast"
         auto_thinking = thinking_mode == "Auto"
@@ -232,7 +228,7 @@ class QwenClient:
                     raise RuntimeError(f"Failed to create chat: {data}")
                 chat_id = data['data']['id']
 
-            # Prepare feature config
+            # Feature config
             feature_config = {
                 "auto_thinking": auto_thinking,
                 "thinking_mode": thinking_mode,
@@ -246,10 +242,10 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
-            # Send message with all sampling parameters and incremental_output = False (fix)
+            # Message payload - incremental_output = False to reduce chunks
             msg_payload = {
                 "stream": True,
-                "incremental_output": False,    # <-- CRITICAL FIX
+                "incremental_output": False,
                 "chat_id": chat_id,
                 "chat_mode": "normal",
                 "model": model,
@@ -287,11 +283,14 @@ class QwenClient:
                 if resp.status != 200:
                     raise RuntimeError(f"Completion failed: {resp.status}")
 
-                # Use iter_lines for proper SSE parsing
-                async for line in resp.content.iter_lines():
+                # Proper SSE parsing using readline()
+                while True:
+                    line = await resp.content.readline()
+                    if not line:
+                        break
+                    line = line.decode('utf-8').strip()
                     if not line:
                         continue
-                    line = line.decode('utf-8').strip()
                     if line.startswith('data:'):
                         data_str = line[5:].strip()
                         if data_str == '[DONE]':
@@ -300,7 +299,6 @@ class QwenClient:
                             yield json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
-                # No leftover buffer needed because iter_lines handles chunks
 
 # ==================== FastAPI Application ====================
 
@@ -308,7 +306,7 @@ class QwenClient:
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy", version="3.0.3", lifespan=lifespan)
+app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy", version="3.0.4", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -326,7 +324,7 @@ async def verify_api_key(x_api_key: Optional[str] = None):
 
 @app.get("/")
 async def root():
-    return {"service": "QwenProxy Fast", "version": "3.0.3", "status": "running"}
+    return {"service": "QwenProxy Fast", "version": "3.0.4", "status": "running"}
 
 @app.get("/v1")
 async def v1_root():
@@ -362,10 +360,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
 
     async def generate_stream():
         created = int(time())
-        full_reasoning_buffer = ""   # accumulate thinking content
         last_heartbeat = time()
-        chunk_counter = 0
-
         try:
             async for raw_chunk in QwenClient.create_chat(
                 model=model,
@@ -399,34 +394,20 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 if "choices" in raw_chunk and raw_chunk["choices"]:
                     finish_reason = raw_chunk["choices"][0].get("finish_reason")
 
-                # Build OpenAI delta – we do NOT send reasoning_content separately
                 delta = {}
-                if phase == "think":
-                    # Accumulate thinking but don't send yet
-                    if content:
-                        full_reasoning_buffer += content
-                else:
-                    # Normal text phase: first flush any accumulated reasoning as regular content?
-                    # To keep compatibility, we send reasoning as content only after think ends.
-                    # But easier: send both as content (some clients ignore reasoning_content)
-                    # We'll just send the current content
-                    if content:
-                        delta["content"] = content
+                # Only send normal content (skip reasoning_content for compatibility)
+                if phase != "think" and content:
+                    delta["content"] = content
 
-                # Send heartbeat if needed (no data for a while)
+                # Heartbeat if no data for a long time
                 now = time()
                 if not delta and not finish_reason:
-                    # Only heartbeat if we have no content and not finishing
                     if now - last_heartbeat >= config.HEARTBEAT_INTERVAL:
                         yield ": heartbeat\n\n"
                         last_heartbeat = now
-                        # Also increment chunk counter to keep connection alive
-                        chunk_counter += 1
                 else:
-                    # Reset heartbeat timer when we send actual data
                     last_heartbeat = now
 
-                # If we have delta or finish_reason, send chunk
                 if delta or finish_reason:
                     chunk_data = {
                         "id": conversation_id,
@@ -440,24 +421,20 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                         }]
                     }
                     yield f"data: {json.dumps(chunk_data)}\n\n"
-                    chunk_counter += 1
-
-                # If finish_reason, also include usage if present
-                if finish_reason and "usage" in raw_chunk:
-                    usage_chunk = {
-                        "id": conversation_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                        "usage": raw_chunk["usage"]
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
 
                 if finish_reason:
+                    if "usage" in raw_chunk:
+                        usage_chunk = {
+                            "id": conversation_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                            "usage": raw_chunk["usage"]
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
                     break
 
-            # After loop, if there was reasoning that never got flushed? Actually Qwen sends final phase="text" with empty? Not needed.
             yield "data: [DONE]\n\n"
         except Exception as e:
             if config.DEBUG:
@@ -478,7 +455,6 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             }
         )
     else:
-        # Non-streaming: accumulate full content
         full_content = ""
         full_reasoning = ""
         usage = None
@@ -526,7 +502,6 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
 
             message = {"role": "assistant", "content": full_content}
             if full_reasoning:
-                # Optionally include reasoning in a non-standard field, but OpenAI clients ignore it
                 message["reasoning_content"] = full_reasoning
 
             return {
