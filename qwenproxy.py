@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QwenProxy - Fixed empty response and stream ending issues
+QwenProxy - Fixed with proper thinking/reasoning separation
 """
 
 from __future__ import annotations
@@ -42,8 +42,9 @@ class Config:
     MIDTOKEN_REFRESH_INTERVAL = 3600
     SINGLE_PROMPT_MODE = os.getenv("QWENPROXY_SINGLE_PROMPT_MODE", "true").lower() == "true"
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
-    HEARTBEAT_INTERVAL = float(os.getenv("QWENPROXY_HEARTBEAT_INTERVAL", "2.0"))  # more frequent
+    HEARTBEAT_INTERVAL = float(os.getenv("QWENPROXY_HEARTBEAT_INTERVAL", "2.0"))
     EMPTY_RESPONSE_TIMEOUT = float(os.getenv("QWENPROXY_EMPTY_TIMEOUT", "30.0"))
+    HIDE_THINKING = os.getenv("QWENPROXY_HIDE_THINKING", "false").lower() == "true"
 
 config = Config()
 
@@ -243,10 +244,10 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
-            # Use incremental_output=True for immediate tokens
+            # incremental_output=True for immediate tokens
             msg_payload = {
                 "stream": True,
-                "incremental_output": True,   # <- send tokens as they arrive
+                "incremental_output": True,
                 "chat_id": chat_id,
                 "chat_mode": "normal",
                 "model": model,
@@ -286,7 +287,6 @@ class QwenClient:
                     raise RuntimeError(f"Completion failed: {resp.status} - {error_text}")
 
                 # SSE parsing
-                buffer = ""
                 while True:
                     line = await resp.content.readline()
                     if not line:
@@ -315,7 +315,7 @@ class QwenClient:
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="QwenProxy", description="OpenAI-compatible Qwen proxy", version="4.1.0", lifespan=lifespan)
+app = FastAPI(title="QwenProxy", description="OpenAI-compatible Qwen proxy", version="4.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -333,7 +333,7 @@ async def verify_api_key(x_api_key: Optional[str] = None):
 
 @app.get("/")
 async def root():
-    return {"service": "QwenProxy", "version": "4.1.0", "status": "running"}
+    return {"service": "QwenProxy", "version": "4.2.0", "status": "running"}
 
 @app.get("/v1")
 async def v1_root():
@@ -367,10 +367,8 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
         finish_reason_sent = False
         first_content_received = False
         empty_response_timeout_start = time()
-        heartbeat_task = None
 
         try:
-            # Create the async generator for Qwen chunks
             qwen_gen = QwenClient.create_chat(
                 model=model,
                 messages=messages,
@@ -387,7 +385,6 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             )
 
             async for raw_chunk in qwen_gen:
-                # Reset empty response timer as soon as any chunk arrives
                 empty_response_timeout_start = time()
 
                 # Extract content and phase
@@ -402,16 +399,19 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 if "choices" in raw_chunk and raw_chunk["choices"]:
                     finish_reason = raw_chunk["choices"][0].get("finish_reason")
 
-                # Build OpenAI delta - send content as is
+                # Build OpenAI delta
                 delta = {}
                 if content:
                     first_content_received = True
-                    # Send ALL content as regular content (compatibility)
-                    delta["content"] = content
-                    if config.DEBUG:
-                        print(f"[SEND] content: {content[:50]}", file=sys.stderr)
+                    if phase == "think":
+                        if not config.HIDE_THINKING:
+                            # Send thinking as reasoning_content (non-standard but supported by many)
+                            delta["reasoning_content"] = content
+                    else:
+                        # Normal content
+                        delta["content"] = content
 
-                # Heartbeat logic
+                # Heartbeat
                 now = time()
                 if not delta and not finish_reason:
                     if now - last_heartbeat >= config.HEARTBEAT_INTERVAL:
@@ -437,21 +437,18 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                         finish_reason_sent = True
                         break
 
-                # Check for empty response timeout (no content received at all)
+                # Empty response fallback
                 if not first_content_received and (time() - empty_response_timeout_start) > config.EMPTY_RESPONSE_TIMEOUT:
-                    # Send a fallback message to avoid empty response
-                    fallback_content = "[Model did not respond in time. Please try again.]"
-                    delta = {"content": fallback_content}
-                    chunk_data = {
+                    fallback = "[Model did not respond in time. Please try again.]"
+                    fallback_delta = {"content": fallback}
+                    fallback_chunk = {
                         "id": conversation_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model,
-                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                        "choices": [{"index": 0, "delta": fallback_delta, "finish_reason": None}]
                     }
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
-                    first_content_received = True
-                    # Then send finish_reason
+                    yield f"data: {json.dumps(fallback_chunk)}\n\n"
                     finish_chunk = {
                         "id": conversation_id,
                         "object": "chat.completion.chunk",
@@ -463,7 +460,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     finish_reason_sent = True
                     break
 
-            # Ensure finish_reason is sent even if missing from last chunk
+            # Ensure finish_reason is sent
             if not finish_reason_sent:
                 final_chunk = {
                     "id": conversation_id,
@@ -479,7 +476,6 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             if config.DEBUG:
                 import traceback
                 traceback.print_exc()
-            # Send error as content so client doesn't see empty response
             error_content = f"[Error: {str(e)}]"
             error_chunk = {
                 "id": conversation_id,
@@ -503,6 +499,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
         )
     else:
         full_content = ""
+        full_reasoning = ""
         usage = None
         finish_reason = "stop"
         try:
@@ -521,10 +518,16 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 server_system_prompt=config.SERVER_SYSTEM_PROMPT
             ):
                 content = raw_chunk.get("content", "")
+                phase = raw_chunk.get("phase")
                 if not content and "choices" in raw_chunk:
                     delta = raw_chunk["choices"][0].get("delta", {})
                     content = delta.get("content", "")
-                full_content += content
+                    phase = delta.get("phase")
+
+                if phase == "think":
+                    full_reasoning += content
+                else:
+                    full_content += content
 
                 if "choices" in raw_chunk and raw_chunk["choices"]:
                     fr = raw_chunk["choices"][0].get("finish_reason")
@@ -533,9 +536,12 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 if "usage" in raw_chunk:
                     usage = raw_chunk["usage"]
 
-            # If still empty, send fallback
-            if not full_content:
+            if not full_content and not full_reasoning:
                 full_content = "[Model returned empty response. Please try again.]"
+
+            message = {"role": "assistant", "content": full_content}
+            if full_reasoning and not config.HIDE_THINKING:
+                message["reasoning_content"] = full_reasoning
 
             return {
                 "id": conversation_id,
@@ -544,7 +550,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_content},
+                    "message": message,
                     "finish_reason": finish_reason
                 }],
                 "usage": usage
