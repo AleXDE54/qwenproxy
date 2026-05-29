@@ -39,10 +39,16 @@ class Config:
     DEFAULT_MODEL = "qwen3-235b-a22b"
     MIDTOKEN_REFRESH_INTERVAL = 3600
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
-    
+
+    # ----- RETRY SETTINGS -----
     RETRY_MAX_ATTEMPTS = int(os.getenv("QWENPROXY_RETRY_MAX_ATTEMPTS", "3"))
     RETRY_MIN_LENGTH = int(os.getenv("QWENPROXY_RETRY_MIN_LENGTH", "50"))
     RETRY_DELAY = float(os.getenv("QWENPROXY_RETRY_DELAY", "1"))
+
+    # ----- COOKIE ROTATION SETTINGS -----
+    COOKIE_REFRESH_REQUESTS = int(os.getenv("QWENPROXY_COOKIE_REFRESH_REQUESTS", "20"))   # new cookies every 20 requests
+    COOKIE_REFRESH_INTERVAL = int(os.getenv("QWENPROXY_COOKIE_REFRESH_INTERVAL", "600"))  # or every 10 minutes (600s)
+    COOKIE_ROTATION_MAX_ATTEMPTS = int(os.getenv("QWENPROXY_COOKIE_ROTATION_MAX_ATTEMPTS", "3"))
 
 config = Config()
 
@@ -94,16 +100,55 @@ def format_conversation(messages: List[ChatMessage], server_system_prompt: str =
         lines.append(f"{role}: {msg.get_content_str()}")
     return "\n".join(lines)
 
-# ==================== Qwen Client ====================
+# ==================== Custom Exceptions ====================
+
+class RateLimitError(Exception):
+    pass
+
+# ==================== Qwen Client with Cookie Rotation ====================
 
 class QwenClient:
     _midtoken: str = None
     _midtoken_last_refresh: int = 0
     _midtoken_lock = asyncio.Lock()
 
+    # Cookie rotation state
+    _current_cookies: Dict[str, str] = None
+    _cookie_lock = asyncio.Lock()
+    _request_count: int = 0
+    _last_cookie_generation: float = 0
+
     @classmethod
-    def _get_headers(cls, token: str = None) -> dict:
-        data = generate_cookies() if has_g4f else {"ssxmod_itna": "", "ssxmod_itna2": ""}
+    def _generate_fresh_cookies(cls) -> Dict[str, str]:
+        if has_g4f:
+            return generate_cookies()
+        return {"ssxmod_itna": "", "ssxmod_itna2": ""}
+
+    @classmethod
+    async def _ensure_fresh_cookies(cls, force: bool = False) -> None:
+        """Check if we need to rotate cookies based on count or time."""
+        async with cls._cookie_lock:
+            now = time.time()
+            should_refresh = (
+                force or
+                cls._current_cookies is None or
+                cls._request_count >= config.COOKIE_REFRESH_REQUESTS or
+                (now - cls._last_cookie_generation) >= config.COOKIE_REFRESH_INTERVAL
+            )
+            if should_refresh:
+                if config.DEBUG:
+                    print(f"[Cookie] Rotating: requests={cls._request_count}, age={now - cls._last_cookie_generation:.1f}s")
+                cls._current_cookies = cls._generate_fresh_cookies()
+                cls._request_count = 0
+                cls._last_cookie_generation = now
+                # Force midtoken refresh as well
+                cls._midtoken = None
+                cls._midtoken_last_refresh = 0
+
+    @classmethod
+    async def _get_headers(cls, token: str = None) -> dict:
+        await cls._ensure_fresh_cookies(force=False)
+        data = cls._current_cookies
         headers = {
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
             'Accept': '*/*',
@@ -139,6 +184,46 @@ class QwenClient:
         return req_headers
 
     @classmethod
+    def _extract_content_and_reasoning(cls, chunk: dict) -> tuple[str, str, Optional[str]]:
+        """Returns (content, reasoning_content, finish_reason)."""
+        content = ""
+        reasoning = ""
+        finish_reason = None
+
+        # Direct fields
+        if "content" in chunk:
+            content = chunk["content"]
+        if "reasoning_content" in chunk:
+            reasoning = chunk["reasoning_content"]
+
+        # Choices->delta
+        choices = chunk.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            if not content:
+                content = delta.get("content", "")
+            if not reasoning:
+                reasoning = delta.get("reasoning_content", "")
+            if not content and "text" in delta:
+                content = delta["text"]
+            finish_reason = choices[0].get("finish_reason")
+
+        # Phase separation
+        if not content and not reasoning:
+            phase = chunk.get("phase")
+            text = chunk.get("text", "")
+            if phase == "think":
+                reasoning = text
+            else:
+                content = text
+
+        # Also check top-level finish_reason
+        if not finish_reason and "finish_reason" in chunk:
+            finish_reason = chunk["finish_reason"]
+
+        return content, reasoning, finish_reason
+
+    @classmethod
     async def create_chat(
         cls,
         model: str,
@@ -153,13 +238,15 @@ class QwenClient:
         aspect_ratio: str = None,
         stop: Optional[List[str]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream raw chunks from Qwen, raising RateLimitError when quota exceeded."""
         enable_thinking = reasoning_effort in ("medium", "high")
         thinking_mode = "Auto" if enable_thinking else "Fast"
         prompt = format_conversation(messages, config.SERVER_SYSTEM_PROMPT)
 
-        async with aiohttp.ClientSession(headers=cls._get_headers()) as session:
+        async with aiohttp.ClientSession(headers=await cls._get_headers()) as session:
             req_headers = await cls._get_req_headers(session)
 
+            # Create chat session
             chat_payload = {
                 "title": "New Chat",
                 "models": [model],
@@ -180,6 +267,7 @@ class QwenClient:
                     raise RuntimeError(f"Chat creation error: {data}")
                 chat_id = data['data']['id']
 
+            # Feature config
             feature_config = {
                 "auto_thinking": enable_thinking,
                 "thinking_mode": thinking_mode,
@@ -193,6 +281,7 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
+            # Generation config (top-level)
             generation_config = {
                 "temperature": temperature,
                 "top_p": top_p,
@@ -203,6 +292,7 @@ class QwenClient:
             if stop:
                 generation_config["stop"] = stop
 
+            # Message payload
             msg_payload = {
                 "stream": True,
                 "incremental_output": True,
@@ -255,6 +345,9 @@ class QwenClient:
                             continue
                         try:
                             parsed = json.loads(data_str)
+                            # Check for rate limit
+                            if parsed.get("success") is False and parsed.get("data", {}).get("code") == "RateLimited":
+                                raise RateLimitError("Daily quota exceeded for this session")
                             if config.DEBUG:
                                 print(f"[RAW] {json.dumps(parsed, ensure_ascii=False)[:500]}")
                             yield parsed
@@ -265,47 +358,19 @@ class QwenClient:
                 if buffer.strip():
                     try:
                         parsed = json.loads(buffer)
+                        if parsed.get("success") is False and parsed.get("data", {}).get("code") == "RateLimited":
+                            raise RateLimitError("Daily quota exceeded for this session")
                         if config.DEBUG:
                             print(f"[RAW final] {json.dumps(parsed, ensure_ascii=False)[:500]}")
                         yield parsed
                     except:
                         pass
 
-    @staticmethod
-    def extract_content_and_reasoning(chunk: Dict[str, Any]) -> tuple[str, str, Optional[str]]:
-        """
-        Returns (content, reasoning_content, finish_reason).
-        Uses 'phase' field to separate thinking vs normal text.
-        """
-        # Determine phase
-        phase = chunk.get("phase")
-        if not phase and "choices" in chunk and chunk["choices"]:
-            delta = chunk["choices"][0].get("delta", {})
-            phase = delta.get("phase")
-        
-        # Extract text
-        text = ""
-        if "content" in chunk:
-            text = chunk["content"]
-        elif "text" in chunk:
-            text = chunk["text"]
-        elif "choices" in chunk and chunk["choices"]:
-            delta = chunk["choices"][0].get("delta", {})
-            text = delta.get("content", "") or delta.get("text", "")
-        
-        # Extract finish_reason
-        finish_reason = None
-        if "choices" in chunk and chunk["choices"]:
-            finish_reason = chunk["choices"][0].get("finish_reason")
-        if not finish_reason and "finish_reason" in chunk:
-            finish_reason = chunk["finish_reason"]
-        
-        # Split based on phase
-        if phase == "think":
-            return "", text, finish_reason
-        else:
-            return text, "", finish_reason
+                # Increment request count after successful completion
+                async with cls._cookie_lock:
+                    cls._request_count += 1
 
+    # ----- Non‑streaming with retry and cookie rotation on rate limit -----
     @classmethod
     async def complete_chat_with_retry(
         cls,
@@ -321,56 +386,84 @@ class QwenClient:
         aspect_ratio: str = None,
         stop: Optional[List[str]] = None,
     ) -> tuple[str, str, Optional[dict], str]:
-        attempt = 1
+        """Non‑streaming with retry, including cookie rotation on rate limit."""
+        rotation_attempt = 0
         last_error = None
-        t = temperature
-        r = reasoning_effort
 
-        while attempt <= config.RETRY_MAX_ATTEMPTS:
-            full_content = ""
-            full_reasoning = ""
-            usage = None
-            finish_reason = "stop"
+        while rotation_attempt < config.COOKIE_ROTATION_MAX_ATTEMPTS:
+            # Force fresh cookies at the start of each rotation attempt (except first)
+            if rotation_attempt > 0:
+                await cls._ensure_fresh_cookies(force=True)
+                if config.DEBUG:
+                    print(f"[RateLimit] Rotating cookies, attempt {rotation_attempt+1}")
 
-            try:
-                async for raw in cls.create_chat(
-                    model=model, messages=messages, temperature=t, top_p=top_p,
-                    max_tokens=max_tokens, presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty, reasoning_effort=r,
-                    chat_type=chat_type, aspect_ratio=aspect_ratio, stop=stop
-                ):
-                    content, reasoning, fr = cls.extract_content_and_reasoning(raw)
-                    full_content += content
-                    full_reasoning += reasoning
-                    if fr:
-                        finish_reason = fr
-                    if "usage" in raw:
-                        usage = raw["usage"]
+            attempt = 1
+            t = temperature
+            r = reasoning_effort
 
-                total_len = len(full_content) + len(full_reasoning)
-                if total_len >= config.RETRY_MIN_LENGTH:
-                    return full_content, full_reasoning, usage, finish_reason
-                else:
+            while attempt <= config.RETRY_MAX_ATTEMPTS:
+                full_content = ""
+                full_reasoning = ""
+                usage = None
+                finish_reason = "stop"
+
+                try:
+                    async for raw in cls.create_chat(
+                        model=model, messages=messages, temperature=t, top_p=top_p,
+                        max_tokens=max_tokens, presence_penalty=presence_penalty,
+                        frequency_penalty=frequency_penalty, reasoning_effort=r,
+                        chat_type=chat_type, aspect_ratio=aspect_ratio, stop=stop
+                    ):
+                        c, rsn, fr = cls._extract_content_and_reasoning(raw)
+                        full_content += c
+                        full_reasoning += rsn
+                        if fr:
+                            finish_reason = fr
+                        if "usage" in raw:
+                            usage = raw["usage"]
+
+                    total_len = len(full_content) + len(full_reasoning)
+                    if total_len >= config.RETRY_MIN_LENGTH:
+                        return full_content, full_reasoning, usage, finish_reason
+                    else:
+                        if config.DEBUG:
+                            print(f"⚠️ Short response ({total_len} chars), retry {attempt}/{config.RETRY_MAX_ATTEMPTS}")
+                        t = max(0.1, t * 0.7)
+                        r = "low"
+                        await asyncio.sleep(config.RETRY_DELAY)
+                        attempt += 1
+
+                except RateLimitError as e:
+                    last_error = e
                     if config.DEBUG:
-                        print(f"⚠️ Short response ({total_len} chars), retry {attempt}/{config.RETRY_MAX_ATTEMPTS}")
-                    t = max(0.1, t * 0.7)
-                    r = "low"
+                        print(f"❌ Rate limit hit, rotating cookies and retrying")
+                    break  # break out of retry loop, go to next rotation attempt
+
+                except Exception as e:
+                    last_error = e
+                    if config.DEBUG:
+                        print(f"❌ Attempt {attempt} failed: {e}")
                     await asyncio.sleep(config.RETRY_DELAY)
                     attempt += 1
-            except Exception as e:
-                last_error = e
-                if config.DEBUG:
-                    print(f"❌ Attempt {attempt} failed: {e}")
-                await asyncio.sleep(config.RETRY_DELAY)
-                attempt += 1
 
-        if last_error:
+            # If we exhausted all retry attempts without hitting rate limit, break out of rotation loop
+            if attempt > config.RETRY_MAX_ATTEMPTS and not isinstance(last_error, RateLimitError):
+                break
+
+            rotation_attempt += 1
+
+        # After all rotations and retries exhausted
+        if isinstance(last_error, RateLimitError):
+            raise RateLimitError("All cookie rotations exhausted, daily limit reached")
+        elif last_error:
             raise last_error
-        return full_content, full_reasoning, usage, finish_reason
+        else:
+            # Fallback (should not happen)
+            return full_content, full_reasoning, usage, finish_reason
 
 # ==================== FastAPI App ====================
 
-app = FastAPI(title="QwenProxy Fixed", version="3.5.0")
+app = FastAPI(title="QwenProxy Auto-Rotate", version="3.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 async def verify_api_key(x_api_key: Optional[str] = None):
@@ -408,14 +501,13 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     aspect_ratio=request.aspect_ratio,
                     stop=request.stop,
                 ):
-                    content, reasoning, finish_reason = QwenClient.extract_content_and_reasoning(raw)
-                    
+                    content, reasoning, finish_reason = QwenClient._extract_content_and_reasoning(raw)
                     delta = {}
                     if reasoning:
                         delta["reasoning_content"] = reasoning
                     if content:
                         delta["content"] = content
-                    
+
                     if delta or finish_reason:
                         chunk = {
                             "id": conv_id,
@@ -425,11 +517,11 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
-                    
+
                     if finish_reason:
                         finished = True
                         break
-                
+
                 if not finished:
                     final_chunk = {
                         "id": conv_id,
@@ -439,7 +531,13 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
-                
+
+                yield "data: [DONE]\n\n"
+            except RateLimitError:
+                error_chunk = {
+                    "error": {"message": "Daily rate limit reached. Please try again later.", "type": "rate_limit"}
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 if config.DEBUG:
@@ -448,7 +546,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 error_chunk = {"error": {"message": str(e), "type": "server_error"}}
                 yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
-        
+
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
         try:
@@ -476,6 +574,8 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
                 "usage": usage or {}
             }
+        except RateLimitError:
+            raise HTTPException(status_code=429, detail="Daily rate limit reached. Please try again later.")
         except Exception as e:
             raise HTTPException(500, str(e))
 
@@ -484,8 +584,8 @@ async def health():
     return {"status": "ok"}
 
 def run_server():
-    print(f"🚀 QwenProxy Fixed v3.5.0 on {config.HOST}:{config.PORT}")
-    print(f"   Debug: {config.DEBUG}")
+    print(f"🚀 QwenProxy Auto-Rotate v3.5.0 on {config.HOST}:{config.PORT}")
+    print(f"   Cookie rotation: every {config.COOKIE_REFRESH_REQUESTS} requests or {config.COOKIE_REFRESH_INTERVAL}s")
     uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="info")
 
 if __name__ == "__main__":
