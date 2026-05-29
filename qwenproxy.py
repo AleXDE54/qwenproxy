@@ -72,7 +72,7 @@ def normalize_content(content: Union[str, List[Dict[str, Any]]]) -> str:
         return " ".join(
             item.get("text", "") if isinstance(item, dict) and item.get("type") == "text"
             else item if isinstance(item, str) else ""
-            for item in content...
+            for item in content
         )
     return str(content)
 
@@ -164,7 +164,7 @@ class QwenClient:
 
     @classmethod
     async def _get_req_headers(cls, session: aiohttp.ClientSession) -> dict:
-        async with cls._midtoken_lock:...
+        async with cls._midtoken_lock:
             current_time = time()
             if not cls._midtoken or (current_time - cls._midtoken_last_refresh) > config.MIDTOKEN_REFRESH_INTERVAL:
                 try:
@@ -202,7 +202,7 @@ class QwenClient:
     ) -> AsyncGenerator[dict, None]:
         """Streams raw Qwen API chunks (always streaming internally)."""
         enable_thinking = reasoning_effort in ("medium", "high")
-        thinking_mode: Literal["Auto", "Thinking", "Fast"] = "A...uto" if enable_thinking else "Fast"
+        thinking_mode: Literal["Auto", "Thinking", "Fast"] = "Auto" if enable_thinking else "Fast"
         auto_thinking = thinking_mode == "Auto"
 
         if use_single_prompt:
@@ -237,7 +237,7 @@ class QwenClient:
                     raise RuntimeError(f"Failed to create chat: {data}")
                 chat_id = data['data']['id']
 
-            # Prepare feature config...
+            # Prepare feature config
             feature_config = {
                 "auto_thinking": auto_thinking,
                 "thinking_mode": thinking_mode,
@@ -274,7 +274,7 @@ class QwenClient:
                     "temperature": temperature,
                     "top_p": top_p,
                     "max_tokens": max_tokens,
-                    "presence_penalty": presence_penalty,...
+                    "presence_penalty": presence_penalty,
                     "frequency_penalty": frequency_penalty
                 }]
             }
@@ -314,7 +314,7 @@ class QwenClient:
                             except:
                                 pass
 
-    # ----- NEW: helper to collect full response (non-stream) with retries -----
+    # ----- helper to collect full response (non-stream) with retries -----
     @classmethod
     async def complete_chat_with_retry(
         cls,
