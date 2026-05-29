@@ -33,15 +33,15 @@ except ImportError:
 
 class Config:
     HOST = os.getenv("QWENPROXY_HOST", "0.0.0.0")
-    PORT = int(os.getenv("QWENPROXY_PORT", 8080))
+    PORT = int(os.getenv("QWENPROXY_PORT", 1234))
     DEBUG = os.getenv("QWENPROXY_DEBUG", "false").lower() == "true"
     API_KEY = os.getenv("QWENPROXY_API_KEY", None)
     PROXY = os.getenv("QWENPROXY_PROXY", None)
     TIMEOUT = int(os.getenv("QWENPROXY_TIMEOUT", 300))
     BASE_URL = "https://chat.qwen.ai"
-    DEFAULT_MODEL = "qwen3-235b-a22b"
+    DEFAULT_MODEL = "qwen-max-latest"
     MIDTOKEN_REFRESH_INTERVAL = 3600
-    SINGLE_PROMPT_MODE = os.getenv("QWENPROXY_SINGLE_PROMPT", "false").lower() == "true"
+    SINGLE_PROMPT_MODE = "true"
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
 
 config = Config()
