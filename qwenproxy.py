@@ -184,6 +184,41 @@ class QwenClient:
         req_headers['bx-v'] = '2.5.31'
         return req_headers
 
+    @staticmethod
+    def _extract_content_from_chunk(chunk: dict) -> tuple[str, str]:
+        """Extract (content, reasoning_content) from a single raw chunk."""
+        content = ""
+        reasoning = ""
+
+        # Try top-level fields first
+        if "content" in chunk:
+            content = chunk.get("content", "")
+        if "reasoning_content" in chunk:
+            reasoning = chunk.get("reasoning_content", "")
+
+        # Check choices array
+        choices = chunk.get("choices", [])
+        if choices:
+            delta = choices[0].get("delta", {})
+            if not content:
+                content = delta.get("content", "")
+            if not reasoning:
+                reasoning = delta.get("reasoning_content", "")
+            # Some Qwen responses use 'text' instead of 'content'
+            if not content and "text" in delta:
+                content = delta["text"]
+
+        # Phase-based separation (if still empty)
+        if not content and not reasoning:
+            phase = chunk.get("phase")
+            text = chunk.get("text", "")
+            if phase == "think":
+                reasoning = text
+            else:
+                content = text
+
+        return content, reasoning
+
     @classmethod
     async def create_chat(
         cls,
@@ -297,24 +332,36 @@ class QwenClient:
                     while '\n' in buffer:
                         line, buffer = buffer.split('\n', 1)
                         line = line.strip()
+                        if not line:
+                            continue
+                        # Some SSE implementations omit "data:" – try both
                         if line.startswith('data:'):
                             data_str = line[5:].strip()
-                            if data_str == '[DONE]':
-                                continue
-                            try:
-                                yield json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-                if buffer.strip():
-                    if buffer.startswith('data:'):
-                        data_str = buffer[5:].strip()
-                        if data_str != '[DONE]':
-                            try:
-                                yield json.loads(data_str)
-                            except:
-                                pass
+                        else:
+                            data_str = line
 
-    # ----- helper to collect full response (non-stream) with retries -----
+                        if data_str == '[DONE]':
+                            continue
+                        try:
+                            parsed = json.loads(data_str)
+                            if config.DEBUG:
+                                print(f"[RAW CHUNK] {json.dumps(parsed, ensure_ascii=False)[:200]}")
+                            yield parsed
+                        except json.JSONDecodeError:
+                            if config.DEBUG:
+                                print(f"[SKIP NON-JSON] {data_str[:100]}")
+                            continue
+                # Process any remaining data
+                if buffer.strip():
+                    try:
+                        parsed = json.loads(buffer)
+                        if config.DEBUG:
+                            print(f"[RAW CHUNK (final)] {json.dumps(parsed, ensure_ascii=False)[:200]}")
+                        yield parsed
+                    except:
+                        pass
+
+    # ----- Non‑streaming with smart retry -----
     @classmethod
     async def complete_chat_with_retry(
         cls,
@@ -338,6 +385,10 @@ class QwenClient:
         attempt = 1
         last_error = None
 
+        # Adjust parameters on retry to avoid stuck behaviour
+        retry_temperature = temperature
+        retry_reasoning = reasoning_effort
+
         while attempt <= config.RETRY_MAX_ATTEMPTS:
             full_content = ""
             full_reasoning = ""
@@ -348,51 +399,39 @@ class QwenClient:
                 async for raw_chunk in cls.create_chat(
                     model=model,
                     messages=messages,
-                    temperature=temperature,
+                    temperature=retry_temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
-                    reasoning_effort=reasoning_effort,
+                    reasoning_effort=retry_reasoning,
                     chat_type=chat_type,
                     aspect_ratio=aspect_ratio,
                     use_single_prompt=use_single_prompt,
                     server_system_prompt=server_system_prompt
                 ):
-                    phase = raw_chunk.get("phase")
-                    if not phase:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            phase = delta.get("phase")
+                    # Extract content from whatever shape Qwen sends
+                    content_chunk, reasoning_chunk = cls._extract_content_from_chunk(raw_chunk)
+                    full_content += content_chunk
+                    full_reasoning += reasoning_chunk
 
-                    content = raw_chunk.get("content", "")
-                    if not content:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            content = choices[0].get("delta", {}).get("content", "")
-
-                    if phase == "think":
-                        full_reasoning += content
-                    else:
-                        full_content += content
-
+                    # Update finish_reason if present
                     if "choices" in raw_chunk and raw_chunk["choices"]:
-                        if raw_chunk["choices"][0].get("finish_reason"):
-                            finish_reason = raw_chunk["choices"][0]["finish_reason"]
-
+                        fr = raw_chunk["choices"][0].get("finish_reason")
+                        if fr:
+                            finish_reason = fr
                     if "usage" in raw_chunk:
                         usage = raw_chunk["usage"]
 
-                # Check if response is acceptable
                 total_len = len(full_content) + len(full_reasoning)
                 if total_len >= config.RETRY_MIN_LENGTH:
-                    # Good response
                     return full_content, full_reasoning, usage, finish_reason
                 else:
-                    # Too short – retry
                     if config.DEBUG:
                         print(f"⚠️ Response too short ({total_len} chars), attempt {attempt}/{config.RETRY_MAX_ATTEMPTS}. Retrying in {config.RETRY_DELAY}s...")
+                    # Lower temperature and disable thinking for subsequent attempts
+                    retry_temperature = min(0.7, retry_temperature * 0.8)
+                    retry_reasoning = "low"
                     await asyncio.sleep(config.RETRY_DELAY)
                     attempt += 1
                     continue
@@ -405,11 +444,10 @@ class QwenClient:
                 attempt += 1
                 continue
 
-        # All attempts exhausted
         if last_error:
             raise last_error
         else:
-            # Return what we have (even if short) as a last resort
+            # Return whatever we have as last resort
             return full_content, full_reasoning, usage, finish_reason
 
 # ==================== FastAPI Application ====================
@@ -418,7 +456,7 @@ class QwenClient:
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy with fallback", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy with fallback", version="3.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -436,7 +474,7 @@ async def verify_api_key(x_api_key: Optional[str] = None):
 
 @app.get("/")
 async def root():
-    return {"service": "QwenProxy Fast", "version": "3.1.0", "status": "running", "retry_enabled": True}
+    return {"service": "QwenProxy Fast", "version": "3.2.0", "status": "running", "retry_enabled": True}
 
 @app.get("/v1")
 async def v1_root():
@@ -470,12 +508,12 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
     use_single_prompt = request.use_single_prompt if request.use_single_prompt is not None else config.SINGLE_PROMPT_MODE
     max_tokens = request.max_tokens if request.max_tokens is not None else 4096
 
-    # For streaming, we cannot easily retry because data already sent.
-    # We'll log a warning if response seems short (but no retry).
+    # ---- STREAMING MODE (with anti‑premature‑finish logic) ----
     if request.stream:
         async def generate_stream():
             created = int(time())
             full_content_buffer = ""
+            finish_seen = False
             try:
                 async for raw_chunk in QwenClient.create_chat(
                     model=model,
@@ -491,34 +529,21 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     use_single_prompt=use_single_prompt,
                     server_system_prompt=config.SERVER_SYSTEM_PROMPT
                 ):
-                    phase = raw_chunk.get("phase")
-                    if not phase:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            phase = delta.get("phase")
-
-                    content = raw_chunk.get("content", "")
-                    if not content:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            content = choices[0].get("delta", {}).get("content", "")
-
-                    if phase != "think":
-                        full_content_buffer += content
-
-                    openai_delta = {}
-                    if phase == "think":
-                        if content:
-                            openai_delta["reasoning_content"] = content
-                    else:
-                        if content:
-                            openai_delta["content"] = content
+                    content, reasoning = QwenClient._extract_content_from_chunk(raw_chunk)
+                    full_content_buffer += content
 
                     finish_reason = None
                     if "choices" in raw_chunk and raw_chunk["choices"]:
                         finish_reason = raw_chunk["choices"][0].get("finish_reason")
 
+                    # Build OpenAI delta
+                    openai_delta = {}
+                    if reasoning:
+                        openai_delta["reasoning_content"] = reasoning
+                    if content:
+                        openai_delta["content"] = content
+
+                    # Only send if there is something to send or finish_reason arrived
                     if openai_delta or finish_reason:
                         chunk_data = {
                             "id": conversation_id,
@@ -533,10 +558,10 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                         }
                         yield f"data: {json.dumps(chunk_data)}\n\n"
 
-                    if finish_reason:
-                        # Warn if final response too short
-                        if len(full_content_buffer) < config.RETRY_MIN_LENGTH:
-                            print(f"⚠️ Streaming response too short ({len(full_content_buffer)} chars). Consider retrying.")
+                    # IMPORTANT: Don't break on finish_reason if we have very little content
+                    # (workaround for Qwen sending stop after 1 token)
+                    if finish_reason and len(full_content_buffer) >= config.RETRY_MIN_LENGTH:
+                        finish_seen = True
                         break
 
                     if "usage" in raw_chunk:
@@ -549,6 +574,20 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                             "usage": raw_chunk["usage"]
                         }
                         yield f"data: {json.dumps(usage_chunk)}\n\n"
+                        finish_seen = True
+                        break
+
+                # If the loop ended without a proper finish_reason but we have some content,
+                # send a final stop chunk.
+                if not finish_seen and full_content_buffer:
+                    chunk_data = {
+                        "id": conversation_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
 
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -569,7 +608,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             }
         )
     else:
-        # NON-STREAMING MODE with automatic retry
+        # ---- NON‑STREAMING (with retry) ----
         try:
             full_content, full_reasoning, usage, finish_reason = await QwenClient.complete_chat_with_retry(
                 model=model,
@@ -618,8 +657,8 @@ def run_server():
     except (TypeError, ValueError):
         port = 8080
 
-    # Print retry settings on startup
     print(f"🚀 Starting QwenProxy with retry: max_attempts={config.RETRY_MAX_ATTEMPTS}, min_length={config.RETRY_MIN_LENGTH}, delay={config.RETRY_DELAY}s")
+    print("💡 Set QWENPROXY_DEBUG=true to see raw API chunks")
 
     uvicorn.run(
         app,
