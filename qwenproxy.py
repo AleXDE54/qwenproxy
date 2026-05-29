@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+QwenProxy - OpenAI-compatible proxy for Qwen AI
+Fixed: streaming, finish_reason, heartbeat, incremental_output=False
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -13,13 +18,12 @@ from contextlib import asynccontextmanager
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+# Optional g4f for cookie generation
 try:
     from g4f.Provider.qwen.cookie_generator import generate_cookies
     has_g4f = True
@@ -54,8 +58,6 @@ all_models = [
     'qwen3-max-2026-01-23', 'qwen-plus-2025-07-28', 'qwen3-coder-plus',
     'qwen3-vl-plus', 'qwen3-omni-flash-2025-12-01', 'qwen-max-latest'
 ]
-
-# ==================== Pydantic Models ====================
 
 def normalize_content(content: Union[str, List[Dict[str, Any]]]) -> str:
     if isinstance(content, str):
@@ -192,6 +194,7 @@ class QwenClient:
         use_single_prompt: bool = False,
         server_system_prompt: str = ""
     ) -> AsyncGenerator[dict, None]:
+        """Yields raw JSON chunks from Qwen API (always streaming)."""
         enable_thinking = reasoning_effort in ("medium", "high")
         thinking_mode: Literal["Auto", "Thinking", "Fast"] = "Auto" if enable_thinking else "Fast"
         auto_thinking = thinking_mode == "Auto"
@@ -207,7 +210,7 @@ class QwenClient:
         async with aiohttp.ClientSession(headers=cls._get_headers()) as session:
             req_headers = await cls._get_req_headers(session)
 
-            # Create a new chat
+            # Create new chat
             chat_payload = {
                 "title": "New Chat",
                 "models": [model],
@@ -242,10 +245,10 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
-            # Message payload - incremental_output = False to reduce chunks
+            # Payload: incremental_output = False to reduce chunk frequency
             msg_payload = {
                 "stream": True,
-                "incremental_output": False,
+                "incremental_output": False,   # ← Critical for stability
                 "chat_id": chat_id,
                 "chat_mode": "normal",
                 "model": model,
@@ -283,7 +286,8 @@ class QwenClient:
                 if resp.status != 200:
                     raise RuntimeError(f"Completion failed: {resp.status}")
 
-                # Proper SSE parsing using readline()
+                # SSE parsing using readline()
+                buffer = ""  # for partial lines (though readline gives full lines)
                 while True:
                     line = await resp.content.readline()
                     if not line:
@@ -306,7 +310,7 @@ class QwenClient:
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy", version="3.0.4", lifespan=lifespan)
+app = FastAPI(title="QwenProxy", description="OpenAI-compatible Qwen proxy", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -324,22 +328,16 @@ async def verify_api_key(x_api_key: Optional[str] = None):
 
 @app.get("/")
 async def root():
-    return {"service": "QwenProxy Fast", "version": "3.0.4", "status": "running"}
+    return {"service": "QwenProxy", "version": "4.0.0", "status": "running"}
 
 @app.get("/v1")
 async def v1_root():
     return HTMLResponse('''
-    <html>
-        <head><title>QwenProxy Fast API</title></head>
-        <body>
-            <h1>QwenProxy Fast API</h1>
-            <p>OpenAI-compatible API for Qwen models</p>
-            <ul>
-                <li><a href="/v1/models">/v1/models</a> - List available models</li>
-                <li><a href="/v1/chat/completions">/v1/chat/completions</a> - Chat completions</li>
-            </ul>
-        </body>
-    </html>
+    <html><head><title>QwenProxy API</title></head>
+    <body><h1>QwenProxy API</h1>
+    <ul><li><a href="/v1/models">/v1/models</a></li>
+    <li><a href="/v1/chat/completions">/v1/chat/completions</a></li></ul>
+    </body></html>
     ''')
 
 @app.get("/v1/models")
@@ -361,6 +359,8 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
     async def generate_stream():
         created = int(time())
         last_heartbeat = time()
+        finish_reason_sent = False
+
         try:
             async for raw_chunk in QwenClient.create_chat(
                 model=model,
@@ -376,30 +376,26 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 use_single_prompt=use_single_prompt,
                 server_system_prompt=config.SERVER_SYSTEM_PROMPT
             ):
-                # Extract phase and content
-                phase = raw_chunk.get("phase")
-                if not phase:
-                    choices = raw_chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        phase = delta.get("phase")
-
+                # Extract content and phase
                 content = raw_chunk.get("content", "")
-                if not content:
-                    choices = raw_chunk.get("choices", [])
-                    if choices:
-                        content = choices[0].get("delta", {}).get("content", "")
+                phase = raw_chunk.get("phase")
+                if not content and "choices" in raw_chunk:
+                    delta = raw_chunk["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                    phase = delta.get("phase")
 
                 finish_reason = None
                 if "choices" in raw_chunk and raw_chunk["choices"]:
                     finish_reason = raw_chunk["choices"][0].get("finish_reason")
 
+                # Build OpenAI delta
                 delta = {}
-                # Only send normal content (skip reasoning_content for compatibility)
-                if phase != "think" and content:
+                if content:
+                    # For strict clients, we send all content as normal content
+                    # (reasoning_content is non-standard and may break them)
                     delta["content"] = content
 
-                # Heartbeat if no data for a long time
+                # Heartbeat if no data for a while
                 now = time()
                 if not delta and not finish_reason:
                     if now - last_heartbeat >= config.HEARTBEAT_INTERVAL:
@@ -421,19 +417,20 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                         }]
                     }
                     yield f"data: {json.dumps(chunk_data)}\n\n"
+                    if finish_reason:
+                        finish_reason_sent = True
+                        break
 
-                if finish_reason:
-                    if "usage" in raw_chunk:
-                        usage_chunk = {
-                            "id": conversation_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                            "usage": raw_chunk["usage"]
-                        }
-                        yield f"data: {json.dumps(usage_chunk)}\n\n"
-                    break
+            # Ensure finish_reason is sent even if missing from last chunk
+            if not finish_reason_sent:
+                final_chunk = {
+                    "id": conversation_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(final_chunk)}\n\n"
 
             yield "data: [DONE]\n\n"
         except Exception as e:
@@ -455,11 +452,10 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
             }
         )
     else:
+        # Non-streaming: accumulate
         full_content = ""
-        full_reasoning = ""
         usage = None
         finish_reason = "stop"
-
         try:
             async for raw_chunk in QwenClient.create_chat(
                 model=model,
@@ -475,23 +471,11 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 use_single_prompt=use_single_prompt,
                 server_system_prompt=config.SERVER_SYSTEM_PROMPT
             ):
-                phase = raw_chunk.get("phase")
-                if not phase:
-                    choices = raw_chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        phase = delta.get("phase")
-
                 content = raw_chunk.get("content", "")
-                if not content:
-                    choices = raw_chunk.get("choices", [])
-                    if choices:
-                        content = choices[0].get("delta", {}).get("content", "")
-
-                if phase == "think":
-                    full_reasoning += content
-                else:
-                    full_content += content
+                if not content and "choices" in raw_chunk:
+                    delta = raw_chunk["choices"][0].get("delta", {})
+                    content = delta.get("content", "")
+                full_content += content
 
                 if "choices" in raw_chunk and raw_chunk["choices"]:
                     fr = raw_chunk["choices"][0].get("finish_reason")
@@ -500,10 +484,6 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 if "usage" in raw_chunk:
                     usage = raw_chunk["usage"]
 
-            message = {"role": "assistant", "content": full_content}
-            if full_reasoning:
-                message["reasoning_content"] = full_reasoning
-
             return {
                 "id": conversation_id,
                 "object": "chat.completion",
@@ -511,7 +491,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": message,
+                    "message": {"role": "assistant", "content": full_content},
                     "finish_reason": finish_reason
                 }],
                 "usage": usage
