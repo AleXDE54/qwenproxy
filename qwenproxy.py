@@ -38,9 +38,6 @@ class Config:
     BASE_URL = "https://chat.qwen.ai"
     DEFAULT_MODEL = "qwen3-235b-a22b"
     MIDTOKEN_REFRESH_INTERVAL = 3600
-    SINGLE_PROMPT_MODE = os.getenv("QWENPROXY_SINGLE_PROMPT", "false").lower() == "true"
-    # NEW: if True, sends full conversation history; if False, only last user message
-    FULL_HISTORY = os.getenv("QWENPROXY_FULL_HISTORY", "true").lower() == "true"
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
     
     RETRY_MAX_ATTEMPTS = int(os.getenv("QWENPROXY_RETRY_MAX_ATTEMPTS", "3"))
@@ -59,25 +56,18 @@ all_models = [
     'qwen-max-latest'
 ]
 
-# ==================== Pydantic Models ====================
+class ChatMessage(BaseModel):
+    role: str
+    content: Union[str, List[Dict[str, Any]]]
 
-def normalize_content(content: Union[str, List[Dict[str, Any]]]) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
+    def get_content_str(self) -> str:
+        if isinstance(self.content, str):
+            return self.content
         return " ".join(
             item.get("text", "") if isinstance(item, dict) and item.get("type") == "text"
             else item if isinstance(item, str) else ""
-            for item in content
+            for item in self.content
         )
-    return str(content)
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str | list[dict]
-
-    def get_content_str(self) -> str:
-        return normalize_content(self.content)
 
 class ChatCompletionRequest(BaseModel):
     model: str = config.DEFAULT_MODEL
@@ -92,28 +82,18 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
     chat_type: Literal["t2t", "search", "artifacts", "web_dev", "deep_research", "t2i", "image_edit", "t2v"] = "t2t"
     aspect_ratio: Optional[Literal["1:1", "4:3", "3:4", "16:9", "9:16"]] = None
-    use_single_prompt: Optional[bool] = None
 
 # ==================== Helper Functions ====================
 
-def build_conversation_prompt(messages: list[ChatMessage]) -> str:
-    """Build a full conversation string for single-prompt mode."""
+def format_conversation(messages: List[ChatMessage], server_system_prompt: str = "") -> str:
+    """Convert the full message list into a single prompt string."""
     lines = []
+    if server_system_prompt:
+        lines.append(f"SYSTEM: {server_system_prompt}")
     for msg in messages:
         role = "SYSTEM" if msg.role == "system" else "AI" if msg.role == "assistant" else "USER"
         lines.append(f"{role}: {msg.get_content_str()}")
     return "\n".join(lines)
-
-def merge_system_prompts(messages: List[ChatMessage], server_system_prompt: str) -> List[ChatMessage]:
-    if not server_system_prompt:
-        return messages
-    new = [ChatMessage(role="system", content=server_system_prompt)]
-    for msg in messages:
-        if msg.role == "system":
-            new[0] = ChatMessage(role="system", content=f"{server_system_prompt}\n\n{msg.get_content_str()}")
-        else:
-            new.append(msg)
-    return new
 
 # ==================== Qwen Client ====================
 
@@ -159,45 +139,11 @@ class QwenClient:
         req_headers['bx-v'] = '2.5.31'
         return req_headers
 
-    @staticmethod
-    def _extract_content_from_chunk(chunk: dict) -> tuple[str, str]:
-        """Extract (content, reasoning_content) from a raw chunk."""
-        content = ""
-        reasoning = ""
-
-        # Direct fields
-        if "content" in chunk:
-            content = chunk.get("content", "")
-        if "reasoning_content" in chunk:
-            reasoning = chunk.get("reasoning_content", "")
-
-        # Choices -> delta
-        choices = chunk.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            if not content:
-                content = delta.get("content", "")
-            if not reasoning:
-                reasoning = delta.get("reasoning_content", "")
-            if not content and "text" in delta:
-                content = delta["text"]
-
-        # Phase separation
-        if not content and not reasoning:
-            phase = chunk.get("phase")
-            text = chunk.get("text", "")
-            if phase == "think":
-                reasoning = text
-            else:
-                content = text
-
-        return content, reasoning
-
     @classmethod
     async def create_chat(
         cls,
         model: str,
-        messages: list[ChatMessage],
+        messages: List[ChatMessage],
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -206,47 +152,17 @@ class QwenClient:
         reasoning_effort: str = "medium",
         chat_type: str = "t2t",
         aspect_ratio: str = None,
-        use_single_prompt: bool = False,
-        server_system_prompt: str = "",
-        stop: Optional[list[str]] = None
-    ) -> AsyncGenerator[dict, None]:
-        """Streams raw Qwen API chunks."""
+        stop: Optional[List[str]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream raw chunks from Qwen."""
         enable_thinking = reasoning_effort in ("medium", "high")
         thinking_mode = "Auto" if enable_thinking else "Fast"
-
-        # Build the user prompt
-        if use_single_prompt or not config.FULL_HISTORY:
-            merged = merge_system_prompts(messages, server_system_prompt)
-            prompt = build_conversation_prompt(merged)
-        else:
-            # Send full conversation history as messages array (not just last user)
-            # Qwen's API expects a 'messages' array with role/content.
-            # We'll construct that instead of a single prompt.
-            qwen_messages = []
-            for msg in messages:
-                if msg.role == "system" and server_system_prompt:
-                    # Merge system prompts
-                    qwen_messages.append({
-                        "role": "system",
-                        "content": f"{server_system_prompt}\n\n{msg.get_content_str()}"
-                    })
-                else:
-                    qwen_messages.append({
-                        "role": msg.role,
-                        "content": msg.get_content_str()
-                    })
-            # We'll use a special flag to indicate that we're sending a full messages array
-            use_messages_array = True
-        if use_single_prompt or not config.FULL_HISTORY:
-            use_messages_array = False
-            prompt = build_conversation_prompt(merge_system_prompts(messages, server_system_prompt))
-
-        message_id = str(uuid.uuid4())
+        prompt = format_conversation(messages, config.SERVER_SYSTEM_PROMPT)
 
         async with aiohttp.ClientSession(headers=cls._get_headers()) as session:
             req_headers = await cls._get_req_headers(session)
 
-            # Create a new chat
+            # Create chat session
             chat_payload = {
                 "title": "New Chat",
                 "models": [model],
@@ -261,13 +177,13 @@ class QwenClient:
                 proxy=config.PROXY
             ) as resp:
                 if resp.status != 200:
-                    raise RuntimeError(f"Failed to create chat: {resp.status}")
+                    raise RuntimeError(f"Chat creation failed: {resp.status}")
                 data = await resp.json()
-                if not (data.get('success') and data.get('data', {}).get('id')):
-                    raise RuntimeError(f"Failed to create chat: {data}")
+                if not data.get('success') or not data.get('data', {}).get('id'):
+                    raise RuntimeError(f"Chat creation error: {data}")
                 chat_id = data['data']['id']
 
-            # Prepare feature config
+            # Feature config
             feature_config = {
                 "auto_thinking": enable_thinking,
                 "thinking_mode": thinking_mode,
@@ -281,8 +197,7 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
-            # Build the message payload with proper generation parameters
-            # According to Qwen's API, parameters like max_tokens, stop, etc. go inside a 'generation_config' object
+            # Generation config (top-level)
             generation_config = {
                 "temperature": temperature,
                 "top_p": top_p,
@@ -293,6 +208,7 @@ class QwenClient:
             if stop:
                 generation_config["stop"] = stop
 
+            # Message payload
             msg_payload = {
                 "stream": True,
                 "incremental_output": True,
@@ -300,8 +216,8 @@ class QwenClient:
                 "chat_mode": "normal",
                 "model": model,
                 "parent_id": None,
-                "messages": [] if use_messages_array else [{
-                    "fid": message_id,
+                "messages": [{
+                    "fid": str(uuid.uuid4()),
                     "parentId": None,
                     "childrenIds": [],
                     "role": "user",
@@ -312,32 +228,9 @@ class QwenClient:
                     "chat_type": chat_type,
                     "feature_config": feature_config,
                     "sub_chat_type": chat_type,
-                    "generation_config": generation_config
-                }]
+                }],
+                "generation_config": generation_config   # ✅ TOP LEVEL
             }
-            if use_messages_array:
-                # When sending full conversation history, the structure is different
-                # We need to embed the messages array directly
-                msg_payload["messages"] = [
-                    {
-                        "fid": str(uuid.uuid4()),
-                        "parentId": None,
-                        "childrenIds": [],
-                        "role": m["role"],
-                        "content": m["content"],
-                        "user_action": "chat" if m["role"] == "user" else None,
-                        "files": [],
-                        "models": [model],
-                        "chat_type": chat_type,
-                        "feature_config": feature_config,
-                        "sub_chat_type": chat_type,
-                        "generation_config": generation_config
-                    } for m in qwen_messages
-                ]
-                # The last message should have user_action = "chat"
-                if msg_payload["messages"]:
-                    msg_payload["messages"][-1]["user_action"] = "chat"
-
             if aspect_ratio:
                 msg_payload["size"] = aspect_ratio
 
@@ -369,7 +262,7 @@ class QwenClient:
                         try:
                             parsed = json.loads(data_str)
                             if config.DEBUG:
-                                print(f"[RAW] {json.dumps(parsed, ensure_ascii=False)[:300]}")
+                                print(f"[RAW] {json.dumps(parsed, ensure_ascii=False)[:500]}")
                             yield parsed
                         except json.JSONDecodeError:
                             if config.DEBUG:
@@ -379,17 +272,16 @@ class QwenClient:
                     try:
                         parsed = json.loads(buffer)
                         if config.DEBUG:
-                            print(f"[RAW final] {json.dumps(parsed, ensure_ascii=False)[:300]}")
+                            print(f"[RAW final] {json.dumps(parsed, ensure_ascii=False)[:500]}")
                         yield parsed
                     except:
                         pass
 
-    # Non‑streaming with retry
     @classmethod
     async def complete_chat_with_retry(
         cls,
         model: str,
-        messages: list[ChatMessage],
+        messages: List[ChatMessage],
         temperature: float,
         top_p: float,
         max_tokens: int,
@@ -398,14 +290,13 @@ class QwenClient:
         reasoning_effort: str = "medium",
         chat_type: str = "t2t",
         aspect_ratio: str = None,
-        use_single_prompt: bool = False,
-        server_system_prompt: str = "",
-        stop: Optional[list[str]] = None
+        stop: Optional[List[str]] = None,
     ) -> tuple[str, str, Optional[dict], str]:
+        """Non‑streaming with retry if response too short."""
         attempt = 1
         last_error = None
-        retry_temperature = temperature
-        retry_reasoning = reasoning_effort
+        t = temperature
+        r = reasoning_effort
 
         while attempt <= config.RETRY_MAX_ATTEMPTS:
             full_content = ""
@@ -414,30 +305,34 @@ class QwenClient:
             finish_reason = "stop"
 
             try:
-                async for raw_chunk in cls.create_chat(
-                    model=model,
-                    messages=messages,
-                    temperature=retry_temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty,
-                    reasoning_effort=retry_reasoning,
-                    chat_type=chat_type,
-                    aspect_ratio=aspect_ratio,
-                    use_single_prompt=use_single_prompt,
-                    server_system_prompt=server_system_prompt,
-                    stop=stop
+                async for raw in cls.create_chat(
+                    model=model, messages=messages, temperature=t, top_p=top_p,
+                    max_tokens=max_tokens, presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty, reasoning_effort=r,
+                    chat_type=chat_type, aspect_ratio=aspect_ratio, stop=stop
                 ):
-                    c, r = cls._extract_content_from_chunk(raw_chunk)
-                    full_content += c
-                    full_reasoning += r
-                    if "choices" in raw_chunk and raw_chunk["choices"]:
-                        fr = raw_chunk["choices"][0].get("finish_reason")
+                    # Extract content
+                    content = ""
+                    reasoning = ""
+                    if "content" in raw:
+                        content = raw["content"]
+                    if "reasoning_content" in raw:
+                        reasoning = raw["reasoning_content"]
+                    if not content and "choices" in raw and raw["choices"]:
+                        delta = raw["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        reasoning = delta.get("reasoning_content", "")
+                    if not content and "text" in raw:
+                        content = raw["text"]
+                    full_content += content
+                    full_reasoning += reasoning
+
+                    if "choices" in raw and raw["choices"]:
+                        fr = raw["choices"][0].get("finish_reason")
                         if fr:
                             finish_reason = fr
-                    if "usage" in raw_chunk:
-                        usage = raw_chunk["usage"]
+                    if "usage" in raw:
+                        usage = raw["usage"]
 
                 total_len = len(full_content) + len(full_reasoning)
                 if total_len >= config.RETRY_MIN_LENGTH:
@@ -445,8 +340,8 @@ class QwenClient:
                 else:
                     if config.DEBUG:
                         print(f"⚠️ Short response ({total_len} chars), retry {attempt}/{config.RETRY_MAX_ATTEMPTS}")
-                    retry_temperature = max(0.1, retry_temperature * 0.7)
-                    retry_reasoning = "low"
+                    t = max(0.1, t * 0.7)
+                    r = "low"
                     await asyncio.sleep(config.RETRY_DELAY)
                     attempt += 1
             except Exception as e:
@@ -462,7 +357,7 @@ class QwenClient:
 
 # ==================== FastAPI App ====================
 
-app = FastAPI(title="QwenProxy", version="3.3.0")
+app = FastAPI(title="QwenProxy Fixed", version="3.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 async def verify_api_key(x_api_key: Optional[str] = None):
@@ -476,22 +371,19 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str] = Depends(verify_api_key)):
-    model = request.model
-    if model not in all_models:
-        raise HTTPException(400, f"Model '{model}' not found")
+    if request.model not in all_models:
+        raise HTTPException(400, f"Model '{request.model}' not found")
 
     conv_id = str(uuid.uuid4())
-    use_single = request.use_single_prompt if request.use_single_prompt is not None else config.SINGLE_PROMPT_MODE
     max_tokens = request.max_tokens or 4096
 
     if request.stream:
         async def stream_generator():
             created = int(time.time())
-            full_content_len = 0
-            finished_normally = False
+            finished = False
             try:
                 async for raw in QwenClient.create_chat(
-                    model=model,
+                    model=request.model,
                     messages=request.messages,
                     temperature=request.temperature,
                     top_p=request.top_p,
@@ -501,15 +393,27 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     reasoning_effort=request.reasoning_effort,
                     chat_type=request.chat_type,
                     aspect_ratio=request.aspect_ratio,
-                    use_single_prompt=use_single,
-                    server_system_prompt=config.SERVER_SYSTEM_PROMPT,
-                    stop=request.stop
+                    stop=request.stop,
                 ):
-                    content, reasoning = QwenClient._extract_content_from_chunk(raw)
-                    full_content_len += len(content)
+                    content = ""
+                    reasoning = ""
                     finish_reason = None
-                    if "choices" in raw and raw["choices"]:
+
+                    # Extract fields
+                    if "content" in raw:
+                        content = raw["content"]
+                    if "reasoning_content" in raw:
+                        reasoning = raw["reasoning_content"]
+                    if not content and "choices" in raw and raw["choices"]:
+                        delta = raw["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        reasoning = delta.get("reasoning_content", "")
                         finish_reason = raw["choices"][0].get("finish_reason")
+                    if not content and "text" in raw:
+                        content = raw["text"]
+                    # Also check for top‑level finish_reason
+                    if not finish_reason and "finish_reason" in raw:
+                        finish_reason = raw["finish_reason"]
 
                     delta = {}
                     if reasoning:
@@ -517,47 +421,48 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     if content:
                         delta["content"] = content
 
-                    # Do not send finish_reason if we have very little content
-                    if finish_reason and full_content_len < config.RETRY_MIN_LENGTH:
-                        if config.DEBUG:
-                            print(f"Ignoring premature finish_reason ({finish_reason}) after {full_content_len} chars")
-                        finish_reason = None
-
+                    # Send chunk if there is content or a finish reason
                     if delta or finish_reason:
                         chunk = {
                             "id": conv_id,
                             "object": "chat.completion.chunk",
                             "created": created,
-                            "model": model,
+                            "model": request.model,
                             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
 
                     if finish_reason:
-                        finished_normally = True
+                        finished = True
                         break
 
-                    if "usage" in raw:
-                        yield f"data: {json.dumps({'id': conv_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': raw['usage']})}\n\n"
-                        finished_normally = True
-                        break
+                # Always send a final stop chunk if not already done
+                if not finished:
+                    final_chunk = {
+                        "id": conv_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
 
-                if not finished_normally and full_content_len > 0:
-                    # Send final stop chunk
-                    yield f"data: {json.dumps({'id': conv_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 if config.DEBUG:
                     import traceback
                     traceback.print_exc()
-                yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
+                error_chunk = {
+                    "error": {"message": str(e), "type": "server_error"}
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
-        # Non‑streaming with retry
         try:
             content, reasoning, usage, finish_reason = await QwenClient.complete_chat_with_retry(
-                model=model,
+                model=request.model,
                 messages=request.messages,
                 temperature=request.temperature,
                 top_p=request.top_p,
@@ -567,9 +472,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 reasoning_effort=request.reasoning_effort,
                 chat_type=request.chat_type,
                 aspect_ratio=request.aspect_ratio,
-                use_single_prompt=use_single,
-                server_system_prompt=config.SERVER_SYSTEM_PROMPT,
-                stop=request.stop
+                stop=request.stop,
             )
             msg = {"role": "assistant", "content": content}
             if reasoning:
@@ -578,7 +481,7 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                 "id": conv_id,
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": model,
+                "model": request.model,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
                 "usage": usage or {}
             }
@@ -590,8 +493,8 @@ async def health():
     return {"status": "ok"}
 
 def run_server():
-    print(f"🚀 QwenProxy v3.3.0 on {config.HOST}:{config.PORT}")
-    print(f"   Full conversation history: {config.FULL_HISTORY}")
+    print(f"🚀 QwenProxy Fixed v3.4.0 on {config.HOST}:{config.PORT}")
+    print(f"   Debug: {config.DEBUG}")
     uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="info")
 
 if __name__ == "__main__":
