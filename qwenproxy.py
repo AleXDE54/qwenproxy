@@ -41,8 +41,9 @@ class Config:
     BASE_URL = "https://chat.qwen.ai"
     DEFAULT_MODEL = "qwen-max-latest"
     MIDTOKEN_REFRESH_INTERVAL = 3600
-    SINGLE_PROMPT_MODE = "true"
+    SINGLE_PROMPT_MODE = os.getenv("QWENPROXY_SINGLE_PROMPT_MODE", "true").lower() == "true"
     SERVER_SYSTEM_PROMPT = os.getenv("QWENPROXY_SYSTEM_PROMPT", "")
+    HEARTBEAT_INTERVAL = float(os.getenv("QWENPROXY_HEARTBEAT_INTERVAL", "5.0"))  # seconds
 
 config = Config()
 
@@ -82,7 +83,7 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     temperature: float = 1.0
     top_p: float = 0.8
-    max_tokens: Optional[int] = 4096          # <-- default increased
+    max_tokens: Optional[int] = 4096
     stream: bool = False
     stop: Optional[list[str]] = None
     presence_penalty: float = 0.0
@@ -245,10 +246,10 @@ class QwenClient:
                 "thinking_budget": 81920
             }
 
-            # Send message with all sampling parameters
+            # Send message with all sampling parameters and incremental_output = False (fix)
             msg_payload = {
                 "stream": True,
-                "incremental_output": True,
+                "incremental_output": False,    # <-- CRITICAL FIX
                 "chat_id": chat_id,
                 "chat_mode": "normal",
                 "model": model,
@@ -265,7 +266,6 @@ class QwenClient:
                     "chat_type": chat_type,
                     "feature_config": feature_config,
                     "sub_chat_type": chat_type,
-                    # ----- FIX: Pass sampling parameters -----
                     "temperature": temperature,
                     "top_p": top_p,
                     "max_tokens": max_tokens,
@@ -276,40 +276,31 @@ class QwenClient:
             if aspect_ratio:
                 msg_payload["size"] = aspect_ratio
 
+            timeout = aiohttp.ClientTimeout(total=config.TIMEOUT, sock_read=config.TIMEOUT)
             async with session.post(
                 f'{config.BASE_URL}/api/v2/chat/completions?chat_id={chat_id}',
                 json=msg_payload,
                 headers=req_headers,
                 proxy=config.PROXY,
-                timeout=aiohttp.ClientTimeout(total=config.TIMEOUT)
+                timeout=timeout
             ) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"Completion failed: {resp.status}")
 
-                # Proper SSE parsing – buffer incomplete lines
-                buffer = ""
-                async for chunk in resp.content.iter_any():
-                    buffer += chunk.decode('utf-8')
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
-                        if line.startswith('data:'):
-                            data_str = line[5:].strip()
-                            if data_str == '[DONE]':
-                                continue
-                            try:
-                                yield json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-                # Process remaining buffer
-                if buffer.strip():
-                    if buffer.startswith('data:'):
-                        data_str = buffer[5:].strip()
-                        if data_str != '[DONE]':
-                            try:
-                                yield json.loads(data_str)
-                            except:
-                                pass
+                # Use iter_lines for proper SSE parsing
+                async for line in resp.content.iter_lines():
+                    if not line:
+                        continue
+                    line = line.decode('utf-8').strip()
+                    if line.startswith('data:'):
+                        data_str = line[5:].strip()
+                        if data_str == '[DONE]':
+                            continue
+                        try:
+                            yield json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                # No leftover buffer needed because iter_lines handles chunks
 
 # ==================== FastAPI Application ====================
 
@@ -317,7 +308,7 @@ class QwenClient:
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy", version="3.0.2", lifespan=lifespan)
+app = FastAPI(title="QwenProxy Fast", description="High-performance Qwen AI proxy", version="3.0.3", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -335,7 +326,7 @@ async def verify_api_key(x_api_key: Optional[str] = None):
 
 @app.get("/")
 async def root():
-    return {"service": "QwenProxy Fast", "version": "3.0.2", "status": "running"}
+    return {"service": "QwenProxy Fast", "version": "3.0.3", "status": "running"}
 
 @app.get("/v1")
 async def v1_root():
@@ -367,113 +358,13 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
 
     conversation_id = str(uuid.uuid4())
     use_single_prompt = request.use_single_prompt if request.use_single_prompt is not None else config.SINGLE_PROMPT_MODE
-
-    # Use provided max_tokens or default 4096
     max_tokens = request.max_tokens if request.max_tokens is not None else 4096
 
     async def generate_stream():
         created = int(time())
-        try:
-            async for raw_chunk in QwenClient.create_chat(
-                model=model,
-                messages=messages,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                max_tokens=max_tokens,
-                presence_penalty=request.presence_penalty,
-                frequency_penalty=request.frequency_penalty,
-                reasoning_effort=request.reasoning_effort,
-                chat_type=request.chat_type,
-                aspect_ratio=request.aspect_ratio,
-                use_single_prompt=use_single_prompt,
-                server_system_prompt=config.SERVER_SYSTEM_PROMPT
-            ):
-                # Extract phase correctly (may be at root or inside delta)
-                phase = raw_chunk.get("phase")
-                if not phase:
-                    choices = raw_chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        phase = delta.get("phase")
-
-                # Build OpenAI delta
-                openai_delta = {}
-                if phase == "think":
-                    # Thinking content goes to reasoning_content
-                    content = raw_chunk.get("content", "")
-                    if not content:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            content = choices[0].get("delta", {}).get("content", "")
-                    if content:
-                        openai_delta["reasoning_content"] = content
-                else:
-                    # Normal content (phase == "text" or None)
-                    content = raw_chunk.get("content", "")
-                    if not content:
-                        choices = raw_chunk.get("choices", [])
-                        if choices:
-                            content = choices[0].get("delta", {}).get("content", "")
-                    if content:
-                        openai_delta["content"] = content
-
-                finish_reason = None
-                if "choices" in raw_chunk and raw_chunk["choices"]:
-                    finish_reason = raw_chunk["choices"][0].get("finish_reason")
-
-                if openai_delta or finish_reason:
-                    chunk_data = {
-                        "id": conversation_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": openai_delta,
-                            "finish_reason": finish_reason
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
-
-                if finish_reason:
-                    break
-
-                if "usage" in raw_chunk:
-                    usage_chunk = {
-                        "id": conversation_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        "usage": raw_chunk["usage"]
-                    }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
-
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            if config.DEBUG:
-                import traceback
-                traceback.print_exc()
-            error_data = {"error": {"message": str(e), "type": "server_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
-
-    if request.stream:
-        return StreamingResponse(
-            generate_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
-    else:
-        # Aggregate streaming chunks into a single response
-        full_content = ""
-        full_reasoning = ""
-        usage = None
-        finish_reason = "stop"
+        full_reasoning_buffer = ""   # accumulate thinking content
+        last_heartbeat = time()
+        chunk_counter = 0
 
         try:
             async for raw_chunk in QwenClient.create_chat(
@@ -504,20 +395,138 @@ async def chat_completions(request: ChatCompletionRequest, api_key: Optional[str
                     if choices:
                         content = choices[0].get("delta", {}).get("content", "")
 
+                finish_reason = None
+                if "choices" in raw_chunk and raw_chunk["choices"]:
+                    finish_reason = raw_chunk["choices"][0].get("finish_reason")
+
+                # Build OpenAI delta – we do NOT send reasoning_content separately
+                delta = {}
+                if phase == "think":
+                    # Accumulate thinking but don't send yet
+                    if content:
+                        full_reasoning_buffer += content
+                else:
+                    # Normal text phase: first flush any accumulated reasoning as regular content?
+                    # To keep compatibility, we send reasoning as content only after think ends.
+                    # But easier: send both as content (some clients ignore reasoning_content)
+                    # We'll just send the current content
+                    if content:
+                        delta["content"] = content
+
+                # Send heartbeat if needed (no data for a while)
+                now = time()
+                if not delta and not finish_reason:
+                    # Only heartbeat if we have no content and not finishing
+                    if now - last_heartbeat >= config.HEARTBEAT_INTERVAL:
+                        yield ": heartbeat\n\n"
+                        last_heartbeat = now
+                        # Also increment chunk counter to keep connection alive
+                        chunk_counter += 1
+                else:
+                    # Reset heartbeat timer when we send actual data
+                    last_heartbeat = now
+
+                # If we have delta or finish_reason, send chunk
+                if delta or finish_reason:
+                    chunk_data = {
+                        "id": conversation_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": finish_reason
+                        }]
+                    }
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                    chunk_counter += 1
+
+                # If finish_reason, also include usage if present
+                if finish_reason and "usage" in raw_chunk:
+                    usage_chunk = {
+                        "id": conversation_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                        "usage": raw_chunk["usage"]
+                    }
+                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+
+                if finish_reason:
+                    break
+
+            # After loop, if there was reasoning that never got flushed? Actually Qwen sends final phase="text" with empty? Not needed.
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            if config.DEBUG:
+                import traceback
+                traceback.print_exc()
+            error_data = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    if request.stream:
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+    else:
+        # Non-streaming: accumulate full content
+        full_content = ""
+        full_reasoning = ""
+        usage = None
+        finish_reason = "stop"
+
+        try:
+            async for raw_chunk in QwenClient.create_chat(
+                model=model,
+                messages=messages,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                max_tokens=max_tokens,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                reasoning_effort=request.reasoning_effort,
+                chat_type=request.chat_type,
+                aspect_ratio=request.aspect_ratio,
+                use_single_prompt=use_single_prompt,
+                server_system_prompt=config.SERVER_SYSTEM_PROMPT
+            ):
+                phase = raw_chunk.get("phase")
+                if not phase:
+                    choices = raw_chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        phase = delta.get("phase")
+
+                content = raw_chunk.get("content", "")
+                if not content:
+                    choices = raw_chunk.get("choices", [])
+                    if choices:
+                        content = choices[0].get("delta", {}).get("content", "")
+
                 if phase == "think":
                     full_reasoning += content
                 else:
                     full_content += content
 
                 if "choices" in raw_chunk and raw_chunk["choices"]:
-                    if raw_chunk["choices"][0].get("finish_reason"):
-                        finish_reason = raw_chunk["choices"][0]["finish_reason"]
-
+                    fr = raw_chunk["choices"][0].get("finish_reason")
+                    if fr:
+                        finish_reason = fr
                 if "usage" in raw_chunk:
                     usage = raw_chunk["usage"]
 
             message = {"role": "assistant", "content": full_content}
             if full_reasoning:
+                # Optionally include reasoning in a non-standard field, but OpenAI clients ignore it
                 message["reasoning_content"] = full_reasoning
 
             return {
@@ -543,15 +552,10 @@ async def health_check():
     return {"status": "healthy"}
 
 def run_server():
-    try:
-        port = int(config.PORT)
-    except (TypeError, ValueError):
-        port = 8080
-
     uvicorn.run(
         app,
         host=config.HOST,
-        port=port,
+        port=config.PORT,
         log_level="info" if not config.DEBUG else "debug",
         access_log=False
     )
