@@ -46,8 +46,8 @@ class Config:
     RETRY_DELAY = float(os.getenv("QWENPROXY_RETRY_DELAY", "1"))
 
     # ----- COOKIE ROTATION SETTINGS -----
-    COOKIE_REFRESH_REQUESTS = int(os.getenv("QWENPROXY_COOKIE_REFRESH_REQUESTS", "20"))   # new cookies every 20 requests
-    COOKIE_REFRESH_INTERVAL = int(os.getenv("QWENPROXY_COOKIE_REFRESH_INTERVAL", "600"))  # or every 10 minutes (600s)
+    COOKIE_REFRESH_REQUESTS = int(os.getenv("QWENPROXY_COOKIE_REFRESH_REQUESTS", "20"))
+    COOKIE_REFRESH_INTERVAL = int(os.getenv("QWENPROXY_COOKIE_REFRESH_INTERVAL", "600"))
     COOKIE_ROTATION_MAX_ATTEMPTS = int(os.getenv("QWENPROXY_COOKIE_ROTATION_MAX_ATTEMPTS", "3"))
 
 config = Config()
@@ -126,7 +126,6 @@ class QwenClient:
 
     @classmethod
     async def _ensure_fresh_cookies(cls, force: bool = False) -> None:
-        """Check if we need to rotate cookies based on count or time."""
         async with cls._cookie_lock:
             now = time.time()
             should_refresh = (
@@ -185,39 +184,44 @@ class QwenClient:
 
     @classmethod
     def _extract_content_and_reasoning(cls, chunk: dict) -> tuple[str, str, Optional[str]]:
-        """Returns (content, reasoning_content, finish_reason)."""
+        """
+        Returns (content, reasoning_content, finish_reason)
+        Handles 'phase' inside delta correctly.
+        """
         content = ""
         reasoning = ""
         finish_reason = None
 
-        # Direct fields
-        if "content" in chunk:
-            content = chunk["content"]
-        if "reasoning_content" in chunk:
-            reasoning = chunk["reasoning_content"]
-
-        # Choices->delta
         choices = chunk.get("choices", [])
         if choices:
             delta = choices[0].get("delta", {})
-            if not content:
-                content = delta.get("content", "")
-            if not reasoning:
-                reasoning = delta.get("reasoning_content", "")
-            if not content and "text" in delta:
-                content = delta["text"]
+            phase = delta.get("phase")               # "think" or "answer"
+            text = delta.get("content", "") or delta.get("text", "")
+
+            if phase == "think":
+                reasoning = text
+            elif phase == "answer":
+                content = text
+            else:
+                # No phase or unknown – treat as normal content
+                content = text
+
+            # Also handle explicit reasoning_content field if present
+            if delta.get("reasoning_content"):
+                reasoning += delta["reasoning_content"]
+
             finish_reason = choices[0].get("finish_reason")
 
-        # Phase separation
+        # Fallback: if nothing found in delta, try root-level fields
         if not content and not reasoning:
             phase = chunk.get("phase")
-            text = chunk.get("text", "")
+            text = chunk.get("content", "") or chunk.get("text", "")
             if phase == "think":
                 reasoning = text
             else:
                 content = text
 
-        # Also check top-level finish_reason
+        # Fallback for finish_reason at root level
         if not finish_reason and "finish_reason" in chunk:
             finish_reason = chunk["finish_reason"]
 
@@ -389,6 +393,9 @@ class QwenClient:
         """Non‑streaming with retry, including cookie rotation on rate limit."""
         rotation_attempt = 0
         last_error = None
+        full_content = full_reasoning = ""
+        usage = None
+        finish_reason = "stop"
 
         while rotation_attempt < config.COOKIE_ROTATION_MAX_ATTEMPTS:
             # Force fresh cookies at the start of each rotation attempt (except first)
