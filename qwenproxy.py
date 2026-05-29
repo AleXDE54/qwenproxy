@@ -33,7 +33,7 @@ except ImportError:
 # ==================== Configuration ====================
 
 class Config:
-    HOST = os.getenv("QWENPROXY_HOST", "0.0.0.0")...
+    HOST = os.getenv("QWENPROXY_HOST", "0.0.0.0")
     PORT = int(os.getenv("QWENPROXY_PORT", 1234))
     DEBUG = os.getenv("QWENPROXY_DEBUG", "false").lower() == "true"
     API_KEY = os.getenv("QWENPROXY_API_KEY", None)
